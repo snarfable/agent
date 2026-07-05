@@ -13,8 +13,7 @@ services:
     volumes:
       - ..:/workspaces/agent
       - build_volume:/workspaces/agent/build
-      - C:/Users/ryanp/.ssh:/home/${DEVUSER}/.ssh
-      - C:/Users/ryanp/certs:/workspaces/certs
+      - Certificates:/workspaces/certs
     command: ["sleep", "infinity"]
 
   broker:
@@ -23,7 +22,7 @@ services:
       - "15672:15672"
       - "15671:15671"
     volumes:
-      - C:/Users/ryanp/certs:/etc/rabbitmq/certs
+      - Certificates:/etc/rabbitmq/certs
     networks:
       - agent_network
     entrypoint: /usr/local/bin/docker-entrypoint.sh
@@ -34,3 +33,4 @@ networks:
 
 volumes:
   build_volume:
+  Certificates:
