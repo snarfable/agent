@@ -20,57 +20,7 @@
 
 using namespace agent;
 
-/**
- * @brief Tests related to the Buffer class
- * 
- * Test the \c Buffer class operations.
- */
-class BufferTest : public ::testing::Test
-{
-protected:
-  void SetUp() override
-  {
-    buffer = new Buffer();
-    buffer->Write(
-      testData.c_str(),
-      std::strlen(testData.c_str())
-    );
-  }
-
-  void TearDown() override
-  {
-    delete buffer;
-  }
-
-  Buffer *buffer;
-  const std::string testData = "Random test data";
-};
-
-class BufferShiftTests : public BufferTest, public ::testing::WithParamInterface<int>
-{
-
-};
-
-TEST_P(BufferShiftTests, BufferShiftCheck)
-{
-  std::size_t originalAvailable = buffer->Available();
-  buffer->Shift(GetParam());
-  EXPECT_EQ(buffer->Available(), originalAvailable - GetParam());
-}
-
-TEST_F(BufferTest, BufferAvailableCheck)
-{
-  EXPECT_EQ(buffer->Available(), testData.length());
-  EXPECT_STREQ(buffer->Data(), testData.c_str());
-}
-
-TEST_F(BufferTest, BufferDrainCheck)
-{
-  buffer->Drain();
-  EXPECT_EQ(buffer->Available(), 0);
-}
-
-INSTANTIATE_TEST_SUITE_P(BufferShiftTestSuite, BufferShiftTests, ::testing::Values(1, 2, 3));
+// Buffer tests live in buffer_t.cpp
 
 /**
  * @brief Tests related to the \c IWorker class

@@ -1,4 +1,4 @@
-add_executable(tests tests.cpp agent_t.cpp)
+add_executable(tests tests.cpp agent_t.cpp buffer_t.cpp)
 target_compile_features(tests PRIVATE cxx_std_17)
 target_include_directories(tests PUBLIC ../src)
 target_link_libraries(tests PUBLIC GTest::gtest GTest::gtest_main spdlog::spdlog agent)

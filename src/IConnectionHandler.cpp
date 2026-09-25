@@ -4,6 +4,8 @@
 #include "agent/Buffer.hpp"
 #include "agent/IWorker.hpp"
 
+#include <algorithm>
+
 #include <amqpcpp.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -219,24 +221,18 @@ void agent::IConnectionHandler::operator()()
        */
       
       // Make sure all bytes read were processed
-      const int rbytes = _socket.receiveBytes(_tmpbuffer.data(), _tmpbuffer.size());
-      if (rbytes < 0)
-        _logger->info("Received rbytes = {}", rbytes);
-      const int wbytes = _inpbuffer.Write(_tmpbuffer.data(), rbytes);
-
-      if (wbytes != rbytes)
-        _logger->debug("Could not write full contents to input buffer");
-
-      const size_t iavail = _inpbuffer.Available();
-      if (iavail > 0)
+      // Never read more than the ring buffer can currently hold
+      const std::size_t space = std::min(_tmpbuffer.size(), _inpbuffer.Space());
+      if (space > 0)
       {
-        const size_t parsed = _connection->parse(_inpbuffer.Data(), iavail);
-
-        if (parsed == iavail)
-          _inpbuffer.Drain();
-        else if (parsed > 0)
-          _inpbuffer.Shift(parsed);
+        const int rbytes = _socket.receiveBytes(_tmpbuffer.data(), static_cast<int>(space));
+        if (rbytes < 0)
+          _logger->error("Socket error: receiveBytes returned {}", rbytes);
+        else if (rbytes > 0)
+          _inpbuffer.Write(_tmpbuffer.data(), static_cast<std::size_t>(rbytes));
       }
+
+      _parseInputBuffer();
       _sendDataFromBuffer();
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -250,35 +246,27 @@ void agent::IConnectionHandler::operator()()
     while (GetState() != WORKER_QUIT)
     {
       // See if there's any data available on the incoming socket
-      const size_t savail = _socket.available();
+      const int savail = _socket.available();
       if (savail > 0)
       {
-        // You might have to resize for larger incoming chunk
-        if (savail > _tmpbuffer.size())
-          _tmpbuffer.resize(savail, 0);
-        
-        // Make sure all bytes read were processed
-        const int rbytes = _socket.receiveBytes(_tmpbuffer.data(), savail);
-        const int wbytes = _inpbuffer.Write(_tmpbuffer.data(), rbytes);
-
-        if (wbytes != rbytes)
-          _logger->debug("Could not write full contents to input buffer");
+        // Never read more than the ring buffer can currently hold; anything
+        // left over stays in the socket until the next pass
+        const std::size_t space = std::min({static_cast<std::size_t>(savail), _tmpbuffer.size(), _inpbuffer.Space()});
+        if (space > 0)
+        {
+          const int rbytes = _socket.receiveBytes(_tmpbuffer.data(), static_cast<int>(space));
+          if (rbytes < 0)
+            _logger->error("Socket error: receiveBytes returned {}", rbytes);
+          else if (rbytes > 0)
+            _inpbuffer.Write(_tmpbuffer.data(), static_cast<std::size_t>(rbytes));
+        }
       }
       else if (savail < 0)
       {
         _logger->error("Socket error: Available bytes on socket < 0");
       }
 
-      const size_t iavail = _inpbuffer.Available();
-      if (iavail > 0)
-      {
-        const size_t parsed = _connection->parse(_inpbuffer.Data(), iavail);
-
-        if (parsed == iavail)
-          _inpbuffer.Drain();
-        else if (parsed > 0)
-          _inpbuffer.Shift(parsed);
-      }
+      _parseInputBuffer();
       _sendDataFromBuffer();
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -295,10 +283,39 @@ void agent::IConnectionHandler::quit()
 
 void agent::IConnectionHandler::_sendDataFromBuffer()
 {
-  size_t avail = _outbuffer.Available();
-  if (avail > 0)
+  // Send the contiguous run of pending bytes and release only what was sent
+  const auto pending = _outbuffer.ContiguousData();
+  if (pending.second > 0)
   {
-    int sent = _socket.sendBytes(_outbuffer.Data(), avail);
-    _logger->info("Sent [{:6d} / {:6d}] bytes from buffer", sent, avail);
+    const int sent = _socket.sendBytes(pending.first, static_cast<int>(pending.second));
+    if (sent > 0)
+      _outbuffer.Consume(static_cast<std::size_t>(sent));
+    _logger->debug("Sent [{:6d} / {:6d}] bytes from buffer", sent, pending.second);
   }
+}
+
+void agent::IConnectionHandler::_parseInputBuffer()
+{
+  if (_connection == nullptr)
+    return;
+
+  const std::size_t iavail = _inpbuffer.Available();
+  if (iavail == 0)
+    return;
+
+  // Zero-copy fast path: hand AMQP-CPP the bytes directly out of the ring
+  auto view = _inpbuffer.ContiguousData();
+
+  // The readable bytes wrap around the end of the ring. AMQP-CPP needs whole
+  // frames in contiguous memory, so linearize into scratch space first.
+  if (view.second < iavail)
+  {
+    if (_parsebuffer.size() < iavail)
+      _parsebuffer.resize(iavail);
+    view.second = _inpbuffer.Peek(_parsebuffer.data(), iavail);
+    view.first = _parsebuffer.data();
+  }
+
+  const std::size_t parsed = _connection->parse(view.first, view.second);
+  _inpbuffer.Consume(parsed);
 }

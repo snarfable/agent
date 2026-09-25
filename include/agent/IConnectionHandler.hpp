@@ -141,7 +141,9 @@ namespace agent
 		Buffer _inpbuffer;
 		Buffer _outbuffer;
 		std::vector<char> _tmpbuffer;
+		std::vector<char> _parsebuffer; // Linearization space for frames that wrap the ring
 		AMQP::Connection* _connection;
 		void _sendDataFromBuffer();
+		void _parseInputBuffer();
 	};
 }
