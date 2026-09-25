@@ -5,6 +5,8 @@
 #include "agent/IWorker.hpp"
 
 #include <algorithm>
+#include <mutex>
+#include <thread>
 
 #include <amqpcpp.h>
 #include <spdlog/spdlog.h>
@@ -140,11 +142,59 @@ void agent::IConnectionHandler::onData(AMQP::Connection *__connection, const cha
   if (_connection == nullptr)
     _connection = __connection;
 
-  // Send any outgoing data that has shown up in the buffer
-  _socket.sendBytes(_data, _size);
+  if (_data == nullptr || _size == 0)
+    return;
 
-  // TODO: Maybe make this debug level?
-  _logger->debug("[onData] Sent {} bytes", _size);
+  // A single call larger than the ring could never be queued contiguously
+  if (_size > _outbuffer.Capacity())
+  {
+    _logger->error("[onData] {} bytes exceeds output buffer capacity {}; dropping", _size, _outbuffer.Capacity());
+    return;
+  }
+
+  const bool onLoopThread = std::this_thread::get_id() == _loopThread.load(std::memory_order_acquire);
+
+  if (onLoopThread)
+  {
+    // The loop thread is also the ring's only consumer, so when the ring is
+    // full it can make room itself by flushing to the socket.
+    std::lock_guard<std::mutex> lock(_outmutex);
+    std::size_t queued = 0;
+    while (queued < _size)
+    {
+      queued += _outbuffer.Write(_data + queued, _size - queued);
+      if (queued < _size && !_sendDataFromBuffer())
+      {
+        _logger->error("[onData] Socket send failed; dropped {} of {} bytes", _size - queued, _size);
+        return;
+      }
+    }
+  }
+  else
+  {
+    // Other threads must never wait while holding the lock, or the loop
+    // thread could block in its own onData() and stop draining the ring.
+    // Queue the whole call at once, or release the lock and retry.
+    for (;;)
+    {
+      {
+        std::lock_guard<std::mutex> lock(_outmutex);
+        if (_outbuffer.Space() >= _size)
+        {
+          _outbuffer.Write(_data, _size);
+          break;
+        }
+      }
+      if (GetState() == WORKER_QUIT)
+      {
+        _logger->error("[onData] Worker quitting; dropped {} bytes", _size);
+        return;
+      }
+      std::this_thread::yield();
+    }
+  }
+
+  _logger->debug("[onData] Queued {} bytes", _size);
 }
 
 void agent::IConnectionHandler::onHeartbeat(AMQP::Connection *__connection)
@@ -205,6 +255,9 @@ Poco::Net::StreamSocket& agent::IConnectionHandler::socket()
 
 void agent::IConnectionHandler::operator()()
 {
+  // Record the consumer thread for onData()
+  _loopThread.store(std::this_thread::get_id(), std::memory_order_release);
+
   // This is the main worker loop for AMQP transactions
   if (_socket.secure())
   {
@@ -272,8 +325,11 @@ void agent::IConnectionHandler::operator()()
     }
   }
 
+  // Flush anything still queued before the loop exits
   if (GetState() == WORKER_QUIT && _outbuffer.Available())
     _sendDataFromBuffer();
+
+  _loopThread.store(std::thread::id(), std::memory_order_release);
 }
 
 void agent::IConnectionHandler::quit()
@@ -281,15 +337,25 @@ void agent::IConnectionHandler::quit()
   SetQuit();
 }
 
-void agent::IConnectionHandler::_sendDataFromBuffer()
+bool agent::IConnectionHandler::_sendDataFromBuffer()
 {
-  // Send the contiguous run of pending bytes and release only what was sent
-  const auto pending = _outbuffer.ContiguousData();
-  if (pending.second > 0)
+  // Consumer side of _outbuffer; only the loop thread calls this. Send in
+  // contiguous runs (two when the pending bytes wrap the ring) and release
+  // only what the socket accepted.
+  for (;;)
   {
+    const auto pending = _outbuffer.ContiguousData();
+    if (pending.second == 0)
+      return true;
+
     const int sent = _socket.sendBytes(pending.first, static_cast<int>(pending.second));
-    if (sent > 0)
-      _outbuffer.Consume(static_cast<std::size_t>(sent));
+    if (sent <= 0)
+    {
+      _logger->error("Socket send failed: sendBytes returned {}", sent);
+      return false;
+    }
+
+    _outbuffer.Consume(static_cast<std::size_t>(sent));
     _logger->debug("Sent [{:6d} / {:6d}] bytes from buffer", sent, pending.second);
   }
 }

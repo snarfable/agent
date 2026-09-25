@@ -9,6 +9,8 @@
 #include <thread>
 #include <vector>
 
+#include <mutex>
+
 #include <gtest/gtest.h>
 
 using agent::Buffer;
@@ -329,4 +331,83 @@ TEST(RingBufferConcurrency, ZeroCopyConsumerSeesIntactStream)
   producer.join();
   EXPECT_EQ(received, total);
   EXPECT_EQ(mismatches, 0u);
+}
+
+TEST(RingBufferConcurrency, MutexSerializedProducersNeverInterleaveRecords)
+{
+  // Mirrors IConnectionHandler::onData(): several threads produce into one
+  // ring through a mutex, each queueing a whole record at once (or releasing
+  // the lock and retrying), while a single lock-free consumer drains it.
+  // Every record must arrive intact, and each producer's records in order.
+  Buffer buffer(512);
+  std::mutex producerLock;
+  constexpr int producers = 4;
+  constexpr std::uint32_t recordsPerProducer = 20000;
+
+  auto produce = [&](std::uint8_t id) {
+    std::mt19937 rng(id);
+    std::uniform_int_distribution<int> payload(0, 40);
+    std::vector<char> record;
+    for (std::uint32_t seq = 0; seq < recordsPerProducer; ++seq)
+    {
+      // Record layout: [id][seq:4][len:1][payload bytes all equal to id]
+      const std::uint8_t len = static_cast<std::uint8_t>(payload(rng));
+      record.assign(6 + len, static_cast<char>(id));
+      std::memcpy(record.data() + 1, &seq, sizeof(seq));
+      record[5] = static_cast<char>(len);
+      for (;;)
+      {
+        {
+          std::lock_guard<std::mutex> lock(producerLock);
+          if (buffer.Space() >= record.size())
+          {
+            buffer.Write(record.data(), record.size());
+            break;
+          }
+        }
+        std::this_thread::yield();
+      }
+    }
+  };
+
+  std::vector<std::thread> threads;
+  for (int p = 0; p < producers; ++p)
+    threads.emplace_back(produce, static_cast<std::uint8_t>(p));
+
+  std::vector<std::uint32_t> nextSeq(producers, 0);
+  std::size_t corrupt = 0;
+  std::size_t received = 0;
+  char header[6];
+  char body[64];
+  while (received < static_cast<std::size_t>(producers) * recordsPerProducer)
+  {
+    if (buffer.Peek(header, sizeof(header)) < sizeof(header))
+    {
+      std::this_thread::yield();
+      continue;
+    }
+    const std::uint8_t len = static_cast<std::uint8_t>(header[5]);
+    if (buffer.Available() < sizeof(header) + len)
+    {
+      std::this_thread::yield();
+      continue;
+    }
+    buffer.Consume(sizeof(header));
+    buffer.Read(body, len);
+
+    const std::uint8_t id = static_cast<std::uint8_t>(header[0]);
+    std::uint32_t seq;
+    std::memcpy(&seq, header + 1, sizeof(seq));
+    if (id >= producers || seq != nextSeq[id]++)
+      ++corrupt;
+    for (std::uint8_t i = 0; i < len; ++i)
+      if (static_cast<std::uint8_t>(body[i]) != id)
+        ++corrupt;
+    ++received;
+  }
+
+  for (auto& t : threads)
+    t.join();
+  EXPECT_EQ(corrupt, 0u);
+  EXPECT_TRUE(buffer.Empty());
 }

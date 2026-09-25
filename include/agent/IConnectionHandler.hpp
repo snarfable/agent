@@ -8,9 +8,12 @@
 #include <Poco/Net/StreamSocket.h>
 #include <Poco/Net/SocketAddress.h>
 
-#include <vector>
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 namespace agent
 {
@@ -60,8 +63,16 @@ namespace agent
 		uint16_t onNegotiate(AMQP::Connection* _connection, uint16_t _interval) override;
 
 		/**
-		 * @brief Callback which acts to send data when present
-		 * 
+		 * @brief Queues outgoing AMQP bytes in the output ring buffer
+		 *
+		 * AMQP-CPP calls this from the connection loop thread (acks,
+		 * heartbeats, and replies generated inside @c parse()) and from user
+		 * threads (for example @c IAMQPWorker::AddMessage() calling
+		 * @c publish()). Producers are serialized with @c _outmutex so the
+		 * ring keeps its single-producer contract, and each call's bytes are
+		 * queued contiguously so frames from different threads never
+		 * interleave. The loop thread sends the queued bytes.
+		 *
 		 * @param _connection The connection object, @c AMQP::Connection
 		 * @param _data Pointer to the bytes to send
 		 * @param _size Number of bytes to send
@@ -142,8 +153,10 @@ namespace agent
 		Buffer _outbuffer;
 		std::vector<char> _tmpbuffer;
 		std::vector<char> _parsebuffer; // Linearization space for frames that wrap the ring
+		std::mutex _outmutex;           // Serializes producers into _outbuffer
+		std::atomic<std::thread::id> _loopThread{}; // Thread running operator()(); sole consumer of _outbuffer
 		AMQP::Connection* _connection;
-		void _sendDataFromBuffer();
+		bool _sendDataFromBuffer();
 		void _parseInputBuffer();
 	};
 }
