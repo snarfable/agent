@@ -1,63 +1,155 @@
 #include "agent/Buffer.hpp"
 
-#include <cstdint>
+#include <algorithm>
 #include <cstring>
-#include <cassert>
-#include <vector>
+#include <limits>
+
+std::size_t agent::Buffer::_roundUpPow2(std::size_t _value) noexcept
+{
+    if (_value < 2)
+        return 2;
+
+    std::size_t result = 1;
+    while (result < _value && result <= (std::numeric_limits<std::size_t>::max() >> 1))
+        result <<= 1;
+    return result;
+}
 
 agent::Buffer::Buffer(std::size_t _size)
-    : _data(_size), _used(0)
+    : _capacity(_roundUpPow2(_size)),
+      _mask(_capacity - 1),
+      _data(new char[_capacity])
 {}
 
-std::size_t agent::Buffer::Write(const char* _input, std::size_t _size)
-{
-    // If the bytes used same as the size, write nothing
-    if (_used == _data.size())
-        return 0;
-    
-    // Number bytes that would be left over after a write
-    std::size_t numBytes = _size + _used;
-    std::size_t written = 0;
-    
-    // If new potential total number bytes < _data's size then write all _size
-    if (numBytes < _data.size())
-        written =  _size;
-    else
-        written = _data.size() - _used; // Else can only write as many
-    
-    // Copy new data into place after current data
-    std::memcpy(_data.data(), _input, written);
-    _used += written;
+// -------------------------------------------------------------------------
+// Producer side
+// -------------------------------------------------------------------------
 
-    // Return number of bytes written
+std::size_t agent::Buffer::Write(const char* _input, std::size_t _size) noexcept
+{
+    if (_input == nullptr || _size == 0)
+        return 0;
+
+    const std::size_t head = _head.load(std::memory_order_relaxed);
+
+    // Refresh the cached read position only if the cached view looks too full
+    std::size_t space = _capacity - (head - _cachedTail);
+    if (space < _size)
+    {
+        _cachedTail = _tail.load(std::memory_order_acquire);
+        space = _capacity - (head - _cachedTail);
+    }
+
+    const std::size_t written = std::min(_size, space);
+    if (written == 0)
+        return 0;
+
+    // Copy in up to two segments: [offset, end) and then [0, remainder)
+    const std::size_t offset = head & _mask;
+    const std::size_t first = std::min(written, _capacity - offset);
+    std::memcpy(_data.get() + offset, _input, first);
+    if (written > first)
+        std::memcpy(_data.get(), _input + first, written - first);
+
+    // Publish the new bytes to the consumer
+    _head.store(head + written, std::memory_order_release);
     return written;
 }
 
-std::size_t agent::Buffer::Available() const
+std::size_t agent::Buffer::Space() const noexcept
 {
-    return _used;
+    const std::size_t head = _head.load(std::memory_order_relaxed);
+    const std::size_t tail = _tail.load(std::memory_order_acquire);
+    return _capacity - (head - tail);
 }
 
-const char* agent::Buffer::Data() const
+// -------------------------------------------------------------------------
+// Consumer side
+// -------------------------------------------------------------------------
+
+std::size_t agent::Buffer::Peek(char* _out, std::size_t _size) const noexcept
 {
-    return _data.data();
+    if (_out == nullptr || _size == 0)
+        return 0;
+
+    const std::size_t tail = _tail.load(std::memory_order_relaxed);
+
+    // Refresh the cached write position only if the cached view looks too empty
+    std::size_t avail = _cachedHead - tail;
+    if (avail < _size)
+    {
+        _cachedHead = _head.load(std::memory_order_acquire);
+        avail = _cachedHead - tail;
+    }
+
+    const std::size_t count = std::min(_size, avail);
+    if (count == 0)
+        return 0;
+
+    const std::size_t offset = tail & _mask;
+    const std::size_t first = std::min(count, _capacity - offset);
+    std::memcpy(_out, _data.get() + offset, first);
+    if (count > first)
+        std::memcpy(_out + first, _data.get(), count - first);
+
+    return count;
 }
 
-void agent::Buffer::Drain()
+std::size_t agent::Buffer::Read(char* _out, std::size_t _size) noexcept
 {
-    _used = 0;
+    const std::size_t count = Peek(_out, _size);
+    if (count > 0)
+        _tail.store(_tail.load(std::memory_order_relaxed) + count, std::memory_order_release);
+    return count;
 }
 
-void agent::Buffer::Shift(std::size_t _count)
+std::pair<const char*, std::size_t> agent::Buffer::ContiguousData() const noexcept
 {
-   assert(_count < _used);
+    const std::size_t tail = _tail.load(std::memory_order_relaxed);
+    _cachedHead = _head.load(std::memory_order_acquire);
 
-   // Get the number that will be left after shift
-   std::size_t newused = _used - _count;
+    const std::size_t avail = _cachedHead - tail;
+    const std::size_t offset = tail & _mask;
+    const std::size_t contiguous = std::min(avail, _capacity - offset);
+    return {_data.get() + offset, contiguous};
+}
 
-   // Move _count : _count + newused to front
-   std::memmove(_data.data(), _data.data() + _count, newused);
+std::size_t agent::Buffer::Consume(std::size_t _size) noexcept
+{
+    const std::size_t tail = _tail.load(std::memory_order_relaxed);
 
-   // Set _used to the new value
-   _used = newused;
+    std::size_t avail = _cachedHead - tail;
+    if (avail < _size)
+    {
+        _cachedHead = _head.load(std::memory_order_acquire);
+        avail = _cachedHead - tail;
+    }
+
+    const std::size_t count = std::min(_size, avail);
+    if (count > 0)
+        _tail.store(tail + count, std::memory_order_release);
+    return count;
+}
+
+void agent::Buffer::Shift(std::size_t _size) noexcept
+{
+    Consume(_size);
+}
+
+void agent::Buffer::Drain() noexcept
+{
+    _cachedHead = _head.load(std::memory_order_acquire);
+    _tail.store(_cachedHead, std::memory_order_release);
+}
+
+// -------------------------------------------------------------------------
+// Either side
+// -------------------------------------------------------------------------
+
+std::size_t agent::Buffer::Available() const noexcept
+{
+    // Load tail first: head only grows, so head - tail can never underflow
+    const std::size_t tail = _tail.load(std::memory_order_acquire);
+    const std::size_t head = _head.load(std::memory_order_acquire);
+    return head - tail;
 }

@@ -4,6 +4,10 @@
 #include "agent/Buffer.hpp"
 #include "agent/IWorker.hpp"
 
+#include <algorithm>
+#include <mutex>
+#include <thread>
+
 #include <amqpcpp.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -138,11 +142,59 @@ void agent::IConnectionHandler::onData(AMQP::Connection *__connection, const cha
   if (_connection == nullptr)
     _connection = __connection;
 
-  // Send any outgoing data that has shown up in the buffer
-  _socket.sendBytes(_data, _size);
+  if (_data == nullptr || _size == 0)
+    return;
 
-  // TODO: Maybe make this debug level?
-  _logger->debug("[onData] Sent {} bytes", _size);
+  // A single call larger than the ring could never be queued contiguously
+  if (_size > _outbuffer.Capacity())
+  {
+    _logger->error("[onData] {} bytes exceeds output buffer capacity {}; dropping", _size, _outbuffer.Capacity());
+    return;
+  }
+
+  const bool onLoopThread = std::this_thread::get_id() == _loopThread.load(std::memory_order_acquire);
+
+  if (onLoopThread)
+  {
+    // The loop thread is also the ring's only consumer, so when the ring is
+    // full it can make room itself by flushing to the socket.
+    std::lock_guard<std::mutex> lock(_outmutex);
+    std::size_t queued = 0;
+    while (queued < _size)
+    {
+      queued += _outbuffer.Write(_data + queued, _size - queued);
+      if (queued < _size && !_sendDataFromBuffer())
+      {
+        _logger->error("[onData] Socket send failed; dropped {} of {} bytes", _size - queued, _size);
+        return;
+      }
+    }
+  }
+  else
+  {
+    // Other threads must never wait while holding the lock, or the loop
+    // thread could block in its own onData() and stop draining the ring.
+    // Queue the whole call at once, or release the lock and retry.
+    for (;;)
+    {
+      {
+        std::lock_guard<std::mutex> lock(_outmutex);
+        if (_outbuffer.Space() >= _size)
+        {
+          _outbuffer.Write(_data, _size);
+          break;
+        }
+      }
+      if (GetState() == WORKER_QUIT)
+      {
+        _logger->error("[onData] Worker quitting; dropped {} bytes", _size);
+        return;
+      }
+      std::this_thread::yield();
+    }
+  }
+
+  _logger->debug("[onData] Queued {} bytes", _size);
 }
 
 void agent::IConnectionHandler::onHeartbeat(AMQP::Connection *__connection)
@@ -203,6 +255,9 @@ Poco::Net::StreamSocket& agent::IConnectionHandler::socket()
 
 void agent::IConnectionHandler::operator()()
 {
+  // Record the consumer thread for onData()
+  _loopThread.store(std::this_thread::get_id(), std::memory_order_release);
+
   // This is the main worker loop for AMQP transactions
   if (_socket.secure())
   {
@@ -219,24 +274,18 @@ void agent::IConnectionHandler::operator()()
        */
       
       // Make sure all bytes read were processed
-      const int rbytes = _socket.receiveBytes(_tmpbuffer.data(), _tmpbuffer.size());
-      if (rbytes < 0)
-        _logger->info("Received rbytes = {}", rbytes);
-      const int wbytes = _inpbuffer.Write(_tmpbuffer.data(), rbytes);
-
-      if (wbytes != rbytes)
-        _logger->debug("Could not write full contents to input buffer");
-
-      const size_t iavail = _inpbuffer.Available();
-      if (iavail > 0)
+      // Never read more than the ring buffer can currently hold
+      const std::size_t space = std::min(_tmpbuffer.size(), _inpbuffer.Space());
+      if (space > 0)
       {
-        const size_t parsed = _connection->parse(_inpbuffer.Data(), iavail);
-
-        if (parsed == iavail)
-          _inpbuffer.Drain();
-        else if (parsed > 0)
-          _inpbuffer.Shift(parsed);
+        const int rbytes = _socket.receiveBytes(_tmpbuffer.data(), static_cast<int>(space));
+        if (rbytes < 0)
+          _logger->error("Socket error: receiveBytes returned {}", rbytes);
+        else if (rbytes > 0)
+          _inpbuffer.Write(_tmpbuffer.data(), static_cast<std::size_t>(rbytes));
       }
+
+      _parseInputBuffer();
       _sendDataFromBuffer();
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -250,42 +299,37 @@ void agent::IConnectionHandler::operator()()
     while (GetState() != WORKER_QUIT)
     {
       // See if there's any data available on the incoming socket
-      const size_t savail = _socket.available();
+      const int savail = _socket.available();
       if (savail > 0)
       {
-        // You might have to resize for larger incoming chunk
-        if (savail > _tmpbuffer.size())
-          _tmpbuffer.resize(savail, 0);
-        
-        // Make sure all bytes read were processed
-        const int rbytes = _socket.receiveBytes(_tmpbuffer.data(), savail);
-        const int wbytes = _inpbuffer.Write(_tmpbuffer.data(), rbytes);
-
-        if (wbytes != rbytes)
-          _logger->debug("Could not write full contents to input buffer");
+        // Never read more than the ring buffer can currently hold; anything
+        // left over stays in the socket until the next pass
+        const std::size_t space = std::min({static_cast<std::size_t>(savail), _tmpbuffer.size(), _inpbuffer.Space()});
+        if (space > 0)
+        {
+          const int rbytes = _socket.receiveBytes(_tmpbuffer.data(), static_cast<int>(space));
+          if (rbytes < 0)
+            _logger->error("Socket error: receiveBytes returned {}", rbytes);
+          else if (rbytes > 0)
+            _inpbuffer.Write(_tmpbuffer.data(), static_cast<std::size_t>(rbytes));
+        }
       }
       else if (savail < 0)
       {
         _logger->error("Socket error: Available bytes on socket < 0");
       }
 
-      const size_t iavail = _inpbuffer.Available();
-      if (iavail > 0)
-      {
-        const size_t parsed = _connection->parse(_inpbuffer.Data(), iavail);
-
-        if (parsed == iavail)
-          _inpbuffer.Drain();
-        else if (parsed > 0)
-          _inpbuffer.Shift(parsed);
-      }
+      _parseInputBuffer();
       _sendDataFromBuffer();
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }
 
+  // Flush anything still queued before the loop exits
   if (GetState() == WORKER_QUIT && _outbuffer.Available())
     _sendDataFromBuffer();
+
+  _loopThread.store(std::thread::id(), std::memory_order_release);
 }
 
 void agent::IConnectionHandler::quit()
@@ -293,12 +337,51 @@ void agent::IConnectionHandler::quit()
   SetQuit();
 }
 
-void agent::IConnectionHandler::_sendDataFromBuffer()
+bool agent::IConnectionHandler::_sendDataFromBuffer()
 {
-  size_t avail = _outbuffer.Available();
-  if (avail > 0)
+  // Consumer side of _outbuffer; only the loop thread calls this. Send in
+  // contiguous runs (two when the pending bytes wrap the ring) and release
+  // only what the socket accepted.
+  for (;;)
   {
-    int sent = _socket.sendBytes(_outbuffer.Data(), avail);
-    _logger->info("Sent [{:6d} / {:6d}] bytes from buffer", sent, avail);
+    const auto pending = _outbuffer.ContiguousData();
+    if (pending.second == 0)
+      return true;
+
+    const int sent = _socket.sendBytes(pending.first, static_cast<int>(pending.second));
+    if (sent <= 0)
+    {
+      _logger->error("Socket send failed: sendBytes returned {}", sent);
+      return false;
+    }
+
+    _outbuffer.Consume(static_cast<std::size_t>(sent));
+    _logger->debug("Sent [{:6d} / {:6d}] bytes from buffer", sent, pending.second);
   }
+}
+
+void agent::IConnectionHandler::_parseInputBuffer()
+{
+  if (_connection == nullptr)
+    return;
+
+  const std::size_t iavail = _inpbuffer.Available();
+  if (iavail == 0)
+    return;
+
+  // Zero-copy fast path: hand AMQP-CPP the bytes directly out of the ring
+  auto view = _inpbuffer.ContiguousData();
+
+  // The readable bytes wrap around the end of the ring. AMQP-CPP needs whole
+  // frames in contiguous memory, so linearize into scratch space first.
+  if (view.second < iavail)
+  {
+    if (_parsebuffer.size() < iavail)
+      _parsebuffer.resize(iavail);
+    view.second = _inpbuffer.Peek(_parsebuffer.data(), iavail);
+    view.first = _parsebuffer.data();
+  }
+
+  const std::size_t parsed = _connection->parse(view.first, view.second);
+  _inpbuffer.Consume(parsed);
 }
