@@ -36,9 +36,9 @@ int main(int argc, char **argv)
 
     Poco::Net::Context::Ptr context = new Poco::Net::Context(
         Poco::Net::Context::Usage::CLIENT_USE,
-        "/workspaces/certs/client_key_test.pem",
-        "/workspaces/certs/client_certificate_test.pem",
-        "/workspaces/certs/ca_certificate_test.pem",
+        "/workspaces/certs/client_key.pem",
+        "/workspaces/certs/client_certificate.pem",
+        "/workspaces/certs/ca_certificate.pem",
         Poco::Net::Context::VERIFY_NONE
     );
 

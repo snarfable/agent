@@ -50,7 +50,8 @@
 		"hbenl.vscode-test-explorer",
 		"novaturion.cpp-classes-creator",
 		"matepek.vscode-catch2-test-adapter",
-		"Continue.continue"
+		"Continue.continue",
+		"GitHub.vscode-github-actions"
 	],
 
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
